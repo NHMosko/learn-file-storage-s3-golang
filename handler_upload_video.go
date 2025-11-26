@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
 	"os"
+	"strings"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
@@ -64,6 +68,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusInternalServerError, "Video format not accepted", err)
 		return
 	}
+	fileExtension := strings.Split(mediaType, "/")[1]
 
 	temp, err := os.CreateTemp("", "temp-video")
 	if err != nil {
@@ -71,7 +76,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	defer os.Remove("temp-video")
+	defer os.Remove(temp.Name())
 	defer temp.Close()
 
 	_, err = io.Copy(temp, file)
@@ -86,9 +91,55 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	bucket := "tubely-372864"
-	cfg.s3Client.PutObject(context.Background(), &s3.PutObjectInput{
-		Bucket: &bucket,
-		
+	aspectRatio, err := getVideoAspectRatio(temp.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't get aspect ratio", err)
+		return
+	}
+
+	fastStart, err := processVideoForFastStart(temp.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't process for fast start", err)
+		return
+	}
+
+	f, err := os.Open(fastStart)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "failed to open processed file", err)
+		return
+	}
+	defer os.Remove(fastStart)
+	defer f.Close()
+	stat, _ := f.Stat()
+
+
+
+	var randomness = make([]byte, 32)
+	rand.Read(randomness)
+	thisRand := base64.RawURLEncoding.EncodeToString(randomness)
+
+	fileKey := fmt.Sprintf("%s/%s.%s", aspectRatio, thisRand, fileExtension)
+
+	_, err = cfg.s3Client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket: aws.String(cfg.s3Bucket),
+		Key: aws.String(fileKey),
+		Body: f,
+		ContentType: aws.String(mediaType),
+		ContentLength: aws.Int64(stat.Size()),
 	})
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "failed to put object on s3", err)
+		return
+	}
+
+	newURL := fmt.Sprintf("%s/%s", cfg.s3CfDistribution, fileKey)
+	video.VideoURL = &newURL
+
+	if err = cfg.db.UpdateVideo(video); err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't UpdateVideo", err)
+		return
+	}
+
+	fmt.Println("upload complete.")
+	respondWithJSON(w, http.StatusOK, video)
 }
